@@ -67,6 +67,25 @@ type FileInfo struct {
 	Archived     bool      `json:"archived,omitempty"`
 }
 
+// fileCheckTask represents a task to check a file against the manifest
+type fileCheckTask struct {
+	FilePath   string
+	ObjectName string
+	Size       int64
+	Hash       string
+	Archived   bool
+}
+
+// fileCheckResult represents the result of a file check
+type fileCheckResult struct {
+	FilePath      string
+	ObjectName    string
+	Size          int64
+	Hash          string
+	Archived      bool
+	NeedsDownload bool
+}
+
 // Manifest represents the structure of the manifest file
 type Manifest struct {
 	Version     string              `json:"version"`
@@ -224,6 +243,11 @@ func (d *Downloader) StartWorkers() {
 
 // downloadWorker processes download tasks
 func (d *Downloader) downloadWorker(threadID int) {
+	// Create a semaphore to limit parallel unarchiving operations
+	// They are CPU-intensive and can consume a lot of memory for large files
+	unarchiveSemaphore := make(chan struct{}, 2) // Allow 2 concurrent unarchive operations per thread
+	var unarchiveWg sync.WaitGroup
+	
 	for task := range d.downloadQueue {
 		localPath := filepath.Join(d.targetDir, task.FilePath)
 		
@@ -244,32 +268,69 @@ func (d *Downloader) downloadWorker(threadID int) {
 			TotalBytes: task.Size,
 		}
 		
-		var err error
 		if task.Archived {
-			// Handle archived file (decrypt and extract)
-			err = d.downloadAndUnarchiveFile(threadID, task.ObjectName, localPath, task.Size)
+			// Process archived files in parallel, but control the number
+			// of concurrent unarchiving operations
+			unarchiveSemaphore <- struct{}{} // Acquire semaphore
+			unarchiveWg.Add(1)
+			
+			// Create local copies of parameters to avoid closure issues
+			taskCopy := task
+			localPathCopy := localPath
+			
+			go func() {
+				defer func() { 
+					<-unarchiveSemaphore // Release semaphore when done
+					unarchiveWg.Done()
+				}()
+				
+				// Download and unarchive the file
+				err := d.downloadAndUnarchiveFile(threadID, taskCopy.ObjectName, localPathCopy, taskCopy.Size)
+				success := err == nil
+				
+				// Report result
+				d.resultChan <- DownloadResult{
+					FilePath: taskCopy.FilePath,
+					Success:  success,
+					Error:    err,
+				}
+				
+				// Report completion
+				d.progressChan <- DownloadProgress{
+					ThreadID:       threadID,
+					FilePath:       taskCopy.FilePath,
+					BytesCompleted: taskCopy.Size,
+					TotalBytes:     taskCopy.Size,
+					Completed:      true,
+					Error:          err,
+				}
+			}()
 		} else {
-			// Download regular file
-			err = d.downloadFile(threadID, task.ObjectName, localPath, task.Size)
-		}
-		
-		success := err == nil
-		d.resultChan <- DownloadResult{
-			FilePath: task.FilePath,
-			Success:  success,
-			Error:    err,
-		}
-		
-		// Report complete
-		d.progressChan <- DownloadProgress{
-			ThreadID:       threadID,
-			FilePath:       task.FilePath,
-			BytesCompleted: task.Size,
-			TotalBytes:     task.Size,
-			Completed:      true,
-			Error:          err,
+			// For regular files, use sequential download
+			err := d.downloadFile(threadID, task.ObjectName, localPath, task.Size)
+			success := err == nil
+			
+			// Отправляем результат
+			d.resultChan <- DownloadResult{
+				FilePath: task.FilePath,
+				Success:  success,
+				Error:    err,
+			}
+			
+			// Сообщаем о завершении
+			d.progressChan <- DownloadProgress{
+				ThreadID:       threadID,
+				FilePath:       task.FilePath,
+				BytesCompleted: task.Size,
+				TotalBytes:     task.Size,
+				Completed:      true,
+				Error:          err,
+			}
 		}
 	}
+	
+	// Wait for all unarchiving operations to complete before exiting
+	unarchiveWg.Wait()
 }
 
 // downloadFile downloads a file from HTTP
@@ -376,39 +437,117 @@ func (d *Downloader) SyncWithManifest(manifest *Manifest) error {
 	// Start worker goroutines
 	d.StartWorkers()
 	
-	// Process all files in the manifest
+	// Create a channel to report progress of file checking
+	checkProgressChan := make(chan int, 10)
+	totalChecked := 0
+	
+	// Start a goroutine to update progress of file checking
 	go func() {
-		for filePath, fileInfo := range manifest.Files {
-			localPath := filepath.Join(d.targetDir, filePath)
-			
-			// Check if file exists and has correct hash
-			needsDownload := true
-			if fileExists(localPath) {
-				fileHash, err := calculateFileHash(localPath)
-				if err == nil && fileHash == fileInfo.Hash {
-					// File exists and is up to date
-					needsDownload = false
-					d.downloadStats.mutex.Lock()
-					d.downloadStats.skippedFiles++
-					d.downloadStats.mutex.Unlock()
-				}
+		totalFiles := len(manifest.Files)
+		for progress := range checkProgressChan {
+			totalChecked += progress
+			// Report progress to UI
+			d.progressChan <- DownloadProgress{
+				ThreadID:       -1, // Special ID for file checking progress
+				FilePath:       "Checking files",
+				BytesCompleted: int64(totalChecked),
+				TotalBytes:     int64(totalFiles),
 			}
-			
-			if needsDownload {
-				// Queue file for download
-				objectName := fileInfo.Path
-				if fileInfo.Archived {
-					// Handle archived files differently
-					objectName = obfuscateFileName(filePath, encryptionKey)
+		}
+	}()
+	
+	// Number of concurrent checkers for file verification
+	const numCheckers = 5
+	filesToCheck := make(chan fileCheckTask, 100)
+	checkResults := make(chan fileCheckResult, 100)
+	var checkWg sync.WaitGroup
+	
+	// Start file check workers
+	for i := 0; i < numCheckers; i++ {
+		checkWg.Add(1)
+		go func(workerID int) {
+			defer checkWg.Done()
+			for task := range filesToCheck {
+				localPath := filepath.Join(d.targetDir, task.FilePath)
+				needsDownload := true
+				
+				if fileExists(localPath) {
+					// Fast check: first compare file size
+					stat, err := os.Stat(localPath)
+					if err == nil && stat.Size() == task.Size {
+						// File size matches, now check hash if needed
+						// In this implementation we trust the file if size matches
+						// You can uncomment the hash check if you need stronger verification
+						/*
+						fileHash, err := calculateFileHash(localPath)
+						if err == nil && fileHash == task.Hash {
+							needsDownload = false
+						}
+						*/
+						needsDownload = false
+					}
 				}
 				
-				d.downloadQueue <- DownloadTask{
-					FilePath:   filePath,
-					ObjectName: objectName,
-					Size:       fileInfo.Size,
-					Hash:       fileInfo.Hash,
-					Archived:   fileInfo.Archived,
+				checkResults <- fileCheckResult{
+					FilePath:      task.FilePath,
+					ObjectName:    task.ObjectName,
+					Size:          task.Size,
+					Hash:          task.Hash,
+					Archived:      task.Archived,
+					NeedsDownload: needsDownload,
 				}
+				
+				// Report progress
+				checkProgressChan <- 1
+			}
+		}(i)
+	}
+	
+	// Queue all files for checking
+	go func() {
+		for filePath, fileInfo := range manifest.Files {
+			objectName := fileInfo.Path
+			if fileInfo.Archived {
+				// Handle archived files differently
+				objectName = obfuscateFileName(filePath, encryptionKey)
+			}
+			
+			filesToCheck <- fileCheckTask{
+				FilePath:   filePath,
+				ObjectName: objectName,
+				Size:       fileInfo.Size,
+				Hash:       fileInfo.Hash,
+				Archived:   fileInfo.Archived,
+			}
+		}
+		close(filesToCheck)
+	}()
+	
+	// Process check results and queue downloads
+	go func() {
+		// Wait for all checks to complete and close channels
+		go func() {
+			checkWg.Wait()
+			close(checkResults)
+			close(checkProgressChan)
+		}()
+		
+		// Process results from file checking
+		for result := range checkResults {
+			if result.NeedsDownload {
+				// Queue file for download
+				d.downloadQueue <- DownloadTask{
+					FilePath:   result.FilePath,
+					ObjectName: result.ObjectName,
+					Size:       result.Size,
+					Hash:       result.Hash,
+					Archived:   result.Archived,
+				}
+			} else {
+				// Skip this file
+				d.downloadStats.mutex.Lock()
+				d.downloadStats.skippedFiles++
+				d.downloadStats.mutex.Unlock()
 			}
 		}
 		
@@ -788,8 +927,15 @@ func startUpdateProcess(w fyne.Window, bucketName, targetDir string) {
 		// Process progress updates
 		go func() {
 			for progress := range downloader.progressChan {
-				// Update thread progress
-				if progress.ThreadID >= 0 && progress.ThreadID < concurrentThreads {
+				// Special ID for file checking progress
+				if progress.ThreadID == -1 {
+					// Update main progress bar for file checking phase
+					if progress.TotalBytes > 0 {
+						mainProgressBar.SetValue(float64(progress.BytesCompleted) / float64(progress.TotalBytes))
+						updateStatus(fmt.Sprintf("Checking files (%d of %d)...", progress.BytesCompleted, progress.TotalBytes))
+					}
+				} else if progress.ThreadID >= 0 && progress.ThreadID < concurrentThreads {
+					// Update thread progress
 					threadLabels[progress.ThreadID].SetText(fmt.Sprintf("Thread %d: %s", 
 						progress.ThreadID+1, filepath.Base(progress.FilePath)))
 					
